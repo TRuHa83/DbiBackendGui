@@ -13,7 +13,6 @@ import threading
 import platform
 import struct
 import time
-import sys
 import re
 import os
 
@@ -148,14 +147,14 @@ def process_list_command():
 def connect_to_switch():
     global text1
     global dev
-    log_shown = False
+    Retry = True
 
     while True:
         dev = usb.core.find(idVendor=0x057E, idProduct=0x3000)
         if dev is None:
-            if not log_shown:
+            if Retry:
                 LOG('Waiting for switch...')
-                log_shown = True
+                Retry = False
             time.sleep(1)
             continue
 
@@ -163,7 +162,6 @@ def connect_to_switch():
 
 
 def start_server():
-    print(file_list)
     connect_to_switch()
     poll_commands()
 
