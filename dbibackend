@@ -2,21 +2,21 @@
 # This script depends on PyUSB. You can get it with pip install pyusb.
 # You will also need libusb installed
 
-import usb.core
-import usb.util
-import struct
-import sys
-import time
-import threading
-
-from binascii import hexlify as hx, unhexlify as uhx
+from tkinter import filedialog, ttk, scrolledtext
 from pathlib import Path
 
-from tkinter import filedialog
-import tkinter as tk
-from tkinter import *
+import usb.core
+import usb.util
 
-from tkinter import scrolledtext
+import tkinter as tk
+import threading
+import platform
+import struct
+import time
+import sys
+import re
+import os
+
 
 CMD_ID_EXIT = 0
 CMD_ID_LIST_OLD = 1
@@ -29,36 +29,37 @@ CMD_TYPE_ACK = 2
 
 BUFFER_SEGMENT_DATA_SIZE = 0x100000
 
-in_ep = None
-out_ep = None
-
 file_list = {}
+root_folder = os.path.abspath('.')
+
 
 def LOG(line):
-    if int(text1.index('end').split('.')[0]) - 1 > 1000: # max 1000 lines of log are shown
-            text1.delete('1.0', tk.END)
-    text1.insert(tk.END, line+'\n')
+    if int(text1.index('end').split('.')[0]) - 1 > 1000:  # max 1000 lines of log are shown
+        text1.delete('1.0', tk.END)
+    text1.insert(tk.END, line + '\n')
     text1.see(tk.END)
+
 
 def process_file_range_command(data_size):
     global file_list
 
     LOG('File range')
-    out_ep.write(struct.pack('<4sIII', b'DBI0', CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size))
+    dev.write(0x01, struct.pack('<4sIII', b'DBI0', CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size))
 
-    file_range_header = in_ep.read(data_size)
+    file_range_header = dev.read(0x81, data_size)
 
     range_size = struct.unpack('<I', file_range_header[:4])[0]
     range_offset = struct.unpack('<Q', file_range_header[4:12])[0]
     nsp_name_len = struct.unpack('<I', file_range_header[12:16])[0]
     nsp_name = bytes(file_range_header[16:]).decode('utf-8')
 
-    LOG('Range Size: {}, Range Offset: {}, Name len: {}, Name: {}'.format(range_size, range_offset, nsp_name_len, nsp_name))
+    LOG('Range Size: {}, Range Offset: {}, Name len: {}, Name: {}'.format(range_size, range_offset, nsp_name_len,
+                                                                          nsp_name))
 
     response_bytes = struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_FILE_RANGE, range_size)
-    out_ep.write(response_bytes)
+    dev.write(0x01, response_bytes)
 
-    ack = bytes(in_ep.read(16, timeout=0))
+    ack = bytes(dev.read(0x81, 16, timeout=0))
     magic = ack[:4]
     cmd_type = struct.unpack('<I', ack[4:8])[0]
     cmd_id = struct.unpack('<I', ack[8:12])[0]
@@ -79,14 +80,15 @@ def process_file_range_command(data_size):
                 read_size = end_off - curr_off
 
             buf = f.read(read_size)
-            out_ep.write(data=buf, timeout=0)
+            dev.write(0x01, data=buf, timeout=0)
             curr_off += read_size
+
 
 def poll_commands():
     LOG('Entering command loop')
     while True:
         try:
-            cmd_header = bytes(in_ep.read(16, timeout=0))
+            cmd_header = bytes(dev.read(0x81, 16, timeout=0))
             magic = cmd_header[:4]
 
             if magic != b'DBI0':
@@ -108,9 +110,10 @@ def poll_commands():
             LOG('Switch connection lost')
             connect_to_switch()
 
+
 def process_exit_command():
     LOG('Exit')
-    out_ep.write(struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0))
+    dev.write(0x01, struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0))
     global root
     root.quit()
 
@@ -127,10 +130,10 @@ def process_list_command():
     nsp_path_list_bytes = nsp_path_list.encode('utf-8')
     nsp_path_list_len = len(nsp_path_list_bytes)
 
-    out_ep.write(struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_LIST, nsp_path_list_len))
+    dev.write(0x01, struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_LIST, nsp_path_list_len))
 
     if nsp_path_list_len > 0:
-        ack = bytes(in_ep.read(16, timeout=0))
+        ack = bytes(dev.read(0x81, 16, timeout=0))
         magic = ack[:4]
         cmd_type = struct.unpack('<I', ack[4:8])[0]
         cmd_id = struct.unpack('<I', ack[8:12])[0]
@@ -139,38 +142,31 @@ def process_list_command():
         # LOG('Cmd Type: {}, Command id: {}, Data size: {}'.format(cmd_type, cmd_id, data_size))
         # LOG('Ack')
 
-        out_ep.write(nsp_path_list_bytes)
+        dev.write(0x01, nsp_path_list_bytes)
+
 
 def connect_to_switch():
-    global in_ep
-    global out_ep
     global text1
+    global dev
+    log_shown = False
+
     while True:
         dev = usb.core.find(idVendor=0x057E, idProduct=0x3000)
         if dev is None:
-            LOG('Waiting for switch...')
+            if not log_shown:
+                LOG('Waiting for switch...')
+                log_shown = True
             time.sleep(1)
             continue
 
-        dev.reset()
-        print('Waiting for switch reset...')
-        time.sleep(1)
-        dev.set_configuration()
-        cfg = dev.get_active_configuration()
-
-        is_out_ep = lambda ep: usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT
-        is_in_ep = lambda ep: usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN
-        out_ep = usb.util.find_descriptor(cfg[(0,0)], custom_match=is_out_ep)
-        in_ep = usb.util.find_descriptor(cfg[(0,0)], custom_match=is_in_ep)
-
-        assert out_ep is not None
-        assert in_ep is not None
         break
+
 
 def start_server():
     print(file_list)
     connect_to_switch()
-    poll_commands()    
+    poll_commands()
+
 
 def do_start_server():
     global server_thread
@@ -180,7 +176,6 @@ def do_start_server():
     global startServerButton
 
     addFolderButton['state'] = 'disabled'
-    addFilesButton['state'] = 'disabled'
     clearListButton['state'] = 'disabled'
     startServerButton['state'] = 'disabled'
 
@@ -188,49 +183,118 @@ def do_start_server():
     server_thread.daemon = True
     server_thread.start()
 
+
 def updateFileList():
     global flist1
     global file_list
     global startServerButton
 
-    flist1.delete('1.0', tk.END)
+    for item in flist1.get_children():
+        flist1.delete(item)
+
     for i, (k, v) in enumerate(sorted(file_list.items())):
-        flist1.insert(tk.END, v.__str__()+'\n')
+        size = os.stat(v)
+        size_gb = size.st_size / (1024 * 1024 * 1024)
+        flist1.insert('', 'end', values=(k, f"{size_gb:.2f} GB"))
 
     if len(file_list) > 0:
         startServerButton['state'] = 'normal'
+        clearListButton['state'] = 'normal'
     else:
         startServerButton['state'] = 'disabled'
+        clearListButton['state'] = 'disabled'
 
-def gui_choose_dir():  
+
+def gui_choose_files():
     global file_list
-    filename = filedialog.askdirectory()
-    if filename == () or filename == '':
-        return
-    d = Path(filename)
-    for file_path in [f for f in d.iterdir() if f.is_file()]:
-        file_list.update({file_path.name : file_path.resolve()})
+    global saved_folder
+    curdir = [saved_folder]
+    returnList = []
+    top = tk.Toplevel(width=20)
+    top.geometry('350x452')
+    top.title('Select File or Folder')
+    top.resizable(True, False)
+    top.columnconfigure(0, weight=1)
+    pbtn = tk.Button(top, text="Select")
+
+    def build_tree(dir):
+        updir = os.path.join(os.path.abspath(dir), '..')
+
+        def go_updir():
+            p = os.path.abspath(updir)
+            dnp = os.path.dirname(updir)
+            retdir = filedialog.askdirectory(initialdir=dnp) \
+                if os.path.samefile(p, dnp) and \
+                   platform.system() == 'Windows' else p
+            curdir[0] = retdir if retdir else dnp
+            build_tree(curdir[0])
+
+        tree = ttk.Treeview(top, height=20)
+        tree.columnconfigure(0, weight=1)
+        tree.heading('#0', text=updir, anchor='w', command=go_updir)
+        pattern = re.compile(r'.*\.(nsp|nsz|xci|xcz)$', re.IGNORECASE)
+
+        for c in sorted(os.listdir(dir)):
+            d = Path(dir) / c
+            if d.is_file() and pattern.match(d.name):
+                tree.insert('', 'end', text=c, open=False)
+            elif d.is_dir():
+                parent_iid = tree.insert('', 'end', text=c, open=False)
+                tree.insert(parent_iid, "end")
+
+        tree.grid(row=0, sticky='ew')
+        pbtn.grid(row=1, sticky='nsew')
+
+        def get_selection():
+            returnList.extend([tree.item(s)['text'] for s in tree.selection() if tree.item(s)['text']])
+            top.destroy()
+
+        pbtn['command'] = get_selection
+
+        def rebuild_tree(e):
+            folder = tree.item(tree.focus())['text']
+            curdir[0] = os.path.join(dir, folder)
+            tree.destroy()
+            build_tree(curdir[0])
+
+        tree.bind('<<TreeviewOpen>>', rebuild_tree)
+
+    build_tree(curdir[0])
+    top.wait_window()
+
+    def process_selection(curdir, selection):
+        pattern = re.compile(r'.*\.(nsp|nsz|xci|xcz)$', re.IGNORECASE)
+        for select in selection:
+            d = Path(curdir) / select
+            if d.is_file() and pattern.match(d.name):
+                file_list[d.name] = d.resolve()
+            elif d.is_dir():
+                for root, dirs, files in os.walk(d):
+                    for name in files:
+                        f = Path(root) / name
+                        if f.is_file() and pattern.match(f.name):
+                            file_list[f.name] = f.resolve()
+                    for name in dirs:
+                        process_selection(root, [name])
+
+    process_selection(curdir[0], returnList)
+    saved_folder = curdir[0]
+
+    with open('dbibackend.cfg', 'w') as config:
+        config.write(saved_folder)
 
     updateFileList()
 
-def gui_choose_files():  
-    global file_list
-    filenames = filedialog.askopenfilenames()
-    for file_path in filenames:
-        d = Path(file_path)
-        file_list.update({d.name : d.resolve()})
 
-    updateFileList()
-
-def gui_clear_list():  
+def gui_clear_list():
     global file_list
 
     file_list.clear()
     updateFileList()
 
-def start_gui(start):
+
+def start_gui():
     global addFolderButton
-    global addFilesButton
     global clearListButton
     global startServerButton
     global text1
@@ -238,43 +302,54 @@ def start_gui(start):
     global root
 
     root = tk.Tk()
-    root.resizable(False, False)
+    root.resizable(True, True)
     root.title('DBI backend GUI')
 
-    canvas1 = tk.Canvas(root, width = 800, height = 500)
-    canvas1.pack()
-    addFolderButton = tk.Button(text='Add folder',command=gui_choose_dir,width=10)
-    canvas1.create_window(0, 0, window=addFolderButton, anchor=tk.NW)
-    addFilesButton = tk.Button(text='Add files',command=gui_choose_files,width=10)
-    canvas1.create_window(100, 0, window=addFilesButton, anchor=tk.NW)
-    clearListButton = tk.Button(text='Clear list',command=gui_clear_list,width=10)
-    canvas1.create_window(200, 0, window=clearListButton, anchor=tk.NW)
+    # Crear un marco para los botones
+    button_frame = tk.Frame(root)
+    button_frame.pack(fill=tk.X, padx=10, pady=5)
 
-    flist1 = tk.scrolledtext.ScrolledText(height=20, width=112)
-    canvas1.create_window(0, 30, window=flist1, anchor=tk.NW)
+    addFolderButton = tk.Button(button_frame, text='Add Games', command=gui_choose_files)
+    addFolderButton.pack(side=tk.LEFT, padx=5)
 
-    startServerButton = tk.Button(text='Start server',state=tk.DISABLED, command=do_start_server,width=10)
-    canvas1.create_window(0, 325, window=startServerButton, anchor=tk.NW)
+    clearListButton = tk.Button(button_frame, text='Clear list', state=tk.DISABLED, command=gui_clear_list)
+    clearListButton.pack(side=tk.LEFT, padx=5)
 
-    text1 = tk.scrolledtext.ScrolledText(height=10, width=112)
-    canvas1.create_window(0, 355, window=text1, anchor=tk.NW)
+    startServerButton = tk.Button(button_frame, text='Start server', state=tk.DISABLED, command=do_start_server)
+    startServerButton.pack(side=tk.RIGHT, padx=5)
 
-    if start:
-        updateFileList()
-        do_start_server()
+    # Crear un Treeview que se ajuste al tamaño de la ventana
+    def adjust_treeview_columns(event):
+        tree_width = flist1.winfo_width()
+        flist1.column("col1", width=int(tree_width * 0.9))
+        flist1.column("col2", width=int(tree_width * 0.1))
+
+    flist1 = ttk.Treeview(root, height=10, columns=("col1", "col2"), show="headings")
+    flist1.heading("col1", text="Games")
+    flist1.heading("col2", text="Size")
+    flist1.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    # Ajustar el tamaño de las columnas en porcentaje
+    flist1.bind("<Configure>", adjust_treeview_columns)
+
+    # Crear un scrolledtext que se ajuste al tamaño de la ventana
+    text1 = scrolledtext.ScrolledText(root, height=10, width=112)
+    text1.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
     root.mainloop()
 
 
-if len(sys.argv) < 2:
-    start_gui(False)
-else:
-    for filename in sys.argv[1:]:
-        d = Path(filename)
-        if d.is_file():
-            file_list.update({d.name: d.resolve()})
-        else:
-            for file_path in [f for f in d.iterdir() if f.is_file()]:
-                file_list.update({file_path.name : file_path.resolve()})
+try:
+    with open("dbibackend.cfg", "r") as file:
+        saved_folder = file.read()
 
-    start_gui(True)
+except FileNotFoundError:
+    saved_folder = os.path.abspath('.')
+    with open('dbibackend.cfg', 'w') as config:
+        config.write(root_folder)
 
+d = Path(saved_folder)
+if not d.is_dir():
+    saved_folder = root_folder
+
+start_gui()
